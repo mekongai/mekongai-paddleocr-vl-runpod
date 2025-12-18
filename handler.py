@@ -157,15 +157,26 @@ async def chat_completions(request: ChatCompletionRequest):
         
         for message in request.messages:
             content = message.content
+            logger.info(f"Processing message role={message.role}, content_type={type(content)}")
+            
             if isinstance(content, list):
-                for item in content:
+                for i, item in enumerate(content):
+                    logger.info(f"  Item {i}: type={type(item)}")
                     if isinstance(item, dict):
-                        if item.get("type") == "image_url":
+                        item_type = item.get("type", "")
+                        if item_type == "image_url":
                             image_url = item.get("image_url", {})
                             url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+                            logger.info(f"  Found image_url, url_prefix={url[:50] if url else 'empty'}...")
                             if url.startswith("data:image"):
-                                image_data = url.split(",", 1)[1] if "," in url else url
-                        elif item.get("type") == "text":
+                                # Extract base64 from data URL
+                                parts = url.split(",", 1)
+                                if len(parts) == 2:
+                                    image_data = parts[1]
+                                    logger.info(f"  Extracted base64 data, length={len(image_data)}")
+                                else:
+                                    logger.warning("  Invalid data URL format")
+                        elif item_type == "text":
                             prompt_text = item.get("text", "")
             elif isinstance(content, str):
                 prompt_text = content
@@ -177,7 +188,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 content={"error": {"message": "No image provided", "type": "invalid_request_error"}}
             )
         
-        logger.info(f"Processing image (base64 length: {len(image_data)})")
+        logger.info(f"Image base64 length: {len(image_data)}")
         
         # Load model if not loaded
         model = load_model()
@@ -188,14 +199,55 @@ async def chat_completions(request: ChatCompletionRequest):
                 content={"error": {"message": f"Model not available: {model_error}", "type": "service_unavailable"}}
             )
         
-        # Decode and save image
-        image_bytes = base64.b64decode(image_data)
+        # Decode base64 to bytes
+        try:
+            # Clean base64 string (remove whitespace, newlines)
+            image_data = image_data.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+            image_bytes = base64.b64decode(image_data)
+            logger.info(f"Decoded image bytes: {len(image_bytes)}")
+        except Exception as e:
+            logger.error(f"Base64 decode error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": f"Invalid base64 image: {e}", "type": "invalid_request_error"}}
+            )
         
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        # Validate it's a real image by checking magic bytes
+        if len(image_bytes) < 8:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Image data too short", "type": "invalid_request_error"}}
+            )
+        
+        # Detect image format from magic bytes
+        if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+            suffix = ".png"
+        elif image_bytes[:2] == b'\xff\xd8':
+            suffix = ".jpg"
+        elif image_bytes[:6] in (b'GIF87a', b'GIF89a'):
+            suffix = ".gif"
+        elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+            suffix = ".webp"
+        else:
+            suffix = ".png"  # Default to PNG
+            logger.warning(f"Unknown image format, magic bytes: {image_bytes[:8].hex()}")
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(image_bytes)
             temp_path = f.name
         
-        logger.info(f"Saved image to: {temp_path}")
+        logger.info(f"Saved image to: {temp_path} (size: {len(image_bytes)} bytes, format: {suffix})")
+        
+        # Verify file was written correctly
+        if not os.path.exists(temp_path):
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": "Failed to save temp image", "type": "internal_error"}}
+            )
+        
+        file_size = os.path.getsize(temp_path)
+        logger.info(f"Temp file size on disk: {file_size} bytes")
         
         try:
             # Run OCR
