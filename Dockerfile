@@ -1,5 +1,7 @@
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
+WORKDIR /app
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
@@ -19,11 +21,23 @@ RUN pip install --no-cache-dir \
 # Install special safetensors for PaddleOCR-VL
 RUN pip install https://paddle-whl.bj.bcebos.com/nightly/cu126/safetensors/safetensors-0.6.2.dev0-cp38-abi3-linux_x86_64.whl
 
-# Note: Model will be downloaded on first request (cold start)
-# Cannot pre-download during build as CUDA is not available
+# Install FastAPI and uvicorn for OpenAI-compatible API server
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    pydantic
 
 # Copy handler
-COPY handler.py /handler.py
+COPY handler.py /app/handler.py
 
-# Run the handler
-CMD ["python", "/handler.py"]
+# Expose port
+ENV PORT=8008
+ENV PORT_HEALTH=8008
+EXPOSE 8008
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8008/health || exit 1
+
+# Run the OpenAI-compatible server
+CMD ["python", "/app/handler.py"]
