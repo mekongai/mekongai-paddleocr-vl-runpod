@@ -1,36 +1,70 @@
 """
 RunPod Handler with OpenAI-Compatible API for PaddleOCR-VL
-
-This runs a FastAPI server that exposes /v1/chat/completions endpoint,
-compatible with PaddleOCRVL library's vllm-server backend.
+Simplified version with better error handling and logging
 """
 import os
+import sys
 import base64
 import tempfile
 import json
 import logging
+import traceback
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
-
-logging.basicConfig(level=logging.INFO)
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
+
+# Log startup
+logger.info("=" * 60)
+logger.info("Starting PaddleOCR-VL OpenAI-Compatible Server")
+logger.info("=" * 60)
+
+try:
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+    import uvicorn
+    logger.info("✅ FastAPI and uvicorn imported successfully")
+except ImportError as e:
+    logger.error(f"❌ Failed to import FastAPI/uvicorn: {e}")
+    sys.exit(1)
 
 # Global pipeline instance
 pipeline = None
+model_loading = False
+model_error = None
 
 def load_model():
     """Load PaddleOCR-VL model once, reuse for all requests."""
-    global pipeline
-    if pipeline is None:
-        from paddlex import create_pipeline
+    global pipeline, model_loading, model_error
+    
+    if pipeline is not None:
+        return pipeline
+    
+    if model_loading:
+        return None
+    
+    model_loading = True
+    
+    try:
         logger.info("Loading PaddleOCR-VL model...")
+        from paddlex import create_pipeline
         pipeline = create_pipeline("PaddleOCR-VL")
-        logger.info("Model loaded successfully!")
-    return pipeline
+        logger.info("✅ Model loaded successfully!")
+        model_error = None
+        return pipeline
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        logger.error(traceback.format_exc())
+        model_error = str(e)
+        return None
+    finally:
+        model_loading = False
 
 
 # ============================================================
@@ -38,16 +72,16 @@ def load_model():
 # ============================================================
 
 class ImageUrl(BaseModel):
-    url: str  # Can be data:image/png;base64,xxx or http URL
+    url: str
 
 class ContentItem(BaseModel):
-    type: str  # "text" or "image_url"
+    type: str
     text: Optional[str] = None
     image_url: Optional[ImageUrl] = None
 
 class Message(BaseModel):
     role: str
-    content: Any  # Can be string or list of ContentItem
+    content: Any
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -55,37 +89,42 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = 4096
     temperature: Optional[float] = 0.0
 
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: Dict[str, str]
-    finish_reason: str
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: Usage
-
 
 # ============================================================
 # FastAPI App
 # ============================================================
 
 app = FastAPI(title="PaddleOCR-VL OpenAI Compatible API")
+logger.info("✅ FastAPI app created")
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"message": "PaddleOCR-VL API", "status": "running"}
 
 
 @app.get("/health")
 @app.get("/ping")
 async def health_check():
     """Health check endpoint for RunPod"""
-    return {"status": "healthy"}
+    global pipeline, model_loading, model_error
+    
+    # If model is loading, return 204 (initializing)
+    if model_loading:
+        return JSONResponse(status_code=204, content={"status": "initializing"})
+    
+    # If model has error, still return healthy but indicate error
+    if model_error:
+        return {"status": "healthy", "model_loaded": False, "error": model_error}
+    
+    # If model not loaded, try to load in background
+    if pipeline is None:
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(load_model))
+        return {"status": "healthy", "model_loaded": False, "loading": True}
+    
+    return {"status": "healthy", "model_loaded": True}
 
 
 @app.get("/v1/models")
@@ -105,12 +144,11 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """
-    OpenAI-compatible chat completions endpoint.
-    Processes images with PaddleOCR-VL.
-    """
+    """OpenAI-compatible chat completions endpoint."""
     import time
     import uuid
+    
+    logger.info(f"Received chat completion request for model: {request.model}")
     
     try:
         # Extract image from messages
@@ -118,29 +156,37 @@ async def chat_completions(request: ChatCompletionRequest):
         prompt_text = ""
         
         for message in request.messages:
-            if isinstance(message.content, list):
-                for item in message.content:
+            content = message.content
+            if isinstance(content, list):
+                for item in content:
                     if isinstance(item, dict):
                         if item.get("type") == "image_url":
                             image_url = item.get("image_url", {})
                             url = image_url.get("url", "") if isinstance(image_url, dict) else ""
                             if url.startswith("data:image"):
-                                # Extract base64 from data URL
                                 image_data = url.split(",", 1)[1] if "," in url else url
                         elif item.get("type") == "text":
                             prompt_text = item.get("text", "")
-                    elif hasattr(item, 'type'):
-                        if item.type == "image_url" and item.image_url:
-                            url = item.image_url.url
-                            if url.startswith("data:image"):
-                                image_data = url.split(",", 1)[1] if "," in url
-                        elif item.type == "text":
-                            prompt_text = item.text or ""
-            elif isinstance(message.content, str):
-                prompt_text = message.content
+            elif isinstance(content, str):
+                prompt_text = content
         
         if not image_data:
-            raise HTTPException(status_code=400, detail="No image provided in request")
+            logger.warning("No image provided in request")
+            return JSONResponse(
+                status_code=400, 
+                content={"error": {"message": "No image provided", "type": "invalid_request_error"}}
+            )
+        
+        logger.info(f"Processing image (base64 length: {len(image_data)})")
+        
+        # Load model if not loaded
+        model = load_model()
+        if model is None:
+            logger.error("Model not available")
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"Model not available: {model_error}", "type": "service_unavailable"}}
+            )
         
         # Decode and save image
         image_bytes = base64.b64decode(image_data)
@@ -149,10 +195,14 @@ async def chat_completions(request: ChatCompletionRequest):
             f.write(image_bytes)
             temp_path = f.name
         
+        logger.info(f"Saved image to: {temp_path}")
+        
         try:
-            # Load model and run OCR
-            model = load_model()
+            # Run OCR
+            start_time = time.time()
             results = list(model.predict(temp_path))
+            elapsed = time.time() - start_time
+            logger.info(f"OCR completed in {elapsed:.2f}s")
             
             # Format output as text
             output_text = ""
@@ -166,58 +216,53 @@ async def chat_completions(request: ChatCompletionRequest):
                 else:
                     page_data = {"text": str(page_result)}
                 
-                # Extract text from OCR result
                 if isinstance(page_data, dict):
-                    # Try different possible formats
                     if 'text' in page_data:
                         output_text += page_data['text'] + "\n"
                     elif 'rec_texts' in page_data:
                         output_text += "\n".join(page_data['rec_texts']) + "\n"
-                    elif 'blocks' in page_data:
-                        for block in page_data.get('blocks', []):
-                            if 'text' in block:
-                                output_text += block['text'] + "\n"
                     else:
                         output_text += json.dumps(page_data) + "\n"
                 else:
                     output_text += str(page_data) + "\n"
             
-            # Build OpenAI-compatible response
-            response = ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                created=int(time.time()),
-                model=request.model,
-                choices=[
-                    ChatCompletionChoice(
-                        index=0,
-                        message={
+            logger.info(f"Extracted {len(output_text)} characters")
+            
+            # Build response
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
                             "role": "assistant",
                             "content": output_text.strip()
                         },
-                        finish_reason="stop"
-                    )
+                        "finish_reason": "stop"
+                    }
                 ],
-                usage=Usage(
-                    prompt_tokens=100,
-                    completion_tokens=len(output_text.split()),
-                    total_tokens=100 + len(output_text.split())
-                )
-            )
-            
-            return response
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": len(output_text.split()),
+                    "total_tokens": 100 + len(output_text.split())
+                }
+            }
             
         finally:
             # Cleanup
             if os.path.exists(temp_path):
                 os.remove(temp_path)
                 
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error processing request: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e), "type": "internal_error"}}
+        )
 
 
 # ============================================================
@@ -227,15 +272,19 @@ async def chat_completions(request: ChatCompletionRequest):
 if __name__ == "__main__":
     # Get port from environment (RunPod sets this)
     port = int(os.environ.get("PORT", 8008))
-    health_port = int(os.environ.get("PORT_HEALTH", port))
     
-    logger.info(f"Starting OpenAI-compatible server on port {port}")
+    logger.info(f"Starting server on port {port}")
+    logger.info(f"Environment PORT={os.environ.get('PORT', 'not set')}")
+    logger.info(f"Environment PORT_HEALTH={os.environ.get('PORT_HEALTH', 'not set')}")
     
-    # Pre-load model
+    # Start loading model in background (don't block startup)
+    import threading
+    threading.Thread(target=load_model, daemon=True).start()
+    
+    # Run server - this must not block or crash
     try:
-        load_model()
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     except Exception as e:
-        logger.warning(f"Could not pre-load model: {e}")
-    
-    # Run server
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        logger.error(f"Failed to start server: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
