@@ -53,6 +53,12 @@ def load_model():
     
     try:
         logger.info("Loading PaddleOCR-VL model...")
+        
+        # Enable dynamic mode - CRITICAL for PaddleOCR-VL
+        import paddle
+        paddle.disable_static()
+        logger.info("✅ Enabled Paddle dynamic mode")
+        
         from paddlex import create_pipeline
         pipeline = create_pipeline("PaddleOCR-VL")
         logger.info("✅ Model loaded successfully!")
