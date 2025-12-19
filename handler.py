@@ -115,10 +115,11 @@ async def root():
 async def health_check():
     """Health check endpoint for RunPod"""
     global pipeline, model_loading, model_error
+    from starlette.responses import Response
     
-    # If model is loading, return 204 (initializing)
+    # If model is loading, return 204 (initializing) - NO BODY for 204
     if model_loading:
-        return JSONResponse(status_code=204, content={"status": "initializing"})
+        return Response(status_code=204)
     
     # If model has error, still return healthy but indicate error
     if model_error:
